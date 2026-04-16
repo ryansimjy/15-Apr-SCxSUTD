@@ -1,0 +1,63 @@
+@import "tailwindcss";
+
+/* Custom scrollbar for live news feed and scenario chain */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: #475569 transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background-color: #475569; /* slate-600 */
+  border-radius: 10px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background-color: #64748b; /* slate-500 */
+}
+
+/* Light theme scrollbar */
+.custom-scrollbar.dark-theme {
+  scrollbar-color: #475569 transparent;
+}
+
+.custom-scrollbar.dark-theme::-webkit-scrollbar-thumb {
+  background-color: #475569; /* slate-600 */
+}
+
+.custom-scrollbar.light-theme {
+  scrollbar-color: #94a3b8 transparent;
+}
+
+.custom-scrollbar.light-theme::-webkit-scrollbar-thumb {
+  background-color: #94a3b8; /* slate-400 for light theme */
+}
+
+/* Light theme support */
+:root {
+  --bg-primary: #0f172a;
+  --bg-secondary: #1e293b;
+  --text-primary: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --border-color: #334155;
+}
+
+html.light body {
+  background-color: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+html.light {
+  --bg-primary: #f8fafc;
+  --bg-secondary: #ffffff;
+  --text-primary: #0f172a;
+  --text-secondary: #334155;
+  --border-color: #e2e8f0;
+}

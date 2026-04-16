@@ -1,0 +1,1553 @@
+import React, { useState, useEffect, useMemo, createContext, useContext, ReactNode } from 'react';
+import { Play, Pause, FastForward, Rewind, Upload, Activity, Link as LinkIcon, Info, Clock, LayoutGrid, ChevronDown, ChevronUp, CheckCircle2, AlertCircle, TrendingDown, TrendingUp, Minus, Settings, Loader2, Sun, Moon, Network, ZoomIn, ZoomOut, Maximize2, Minimize2 } from 'lucide-react';
+import { parseLensHistory, parseSentimentCache, formatTime } from './utils';
+import { SentimentItem, LensHistoryItem, Scenario, AssetHeatmapItem, Theme, GraphData } from './types';
+import { generateScenarios, LLMConfig } from './llmService';
+
+// Theme Context for nested components
+interface ThemeContextType {
+  theme: Theme;
+}
+
+const ThemeContext = createContext<ThemeContextType | undefined>(undefined);
+
+const useTheme = () => {
+  const context = useContext(ThemeContext);
+  if (!context) {
+    throw new Error('useTheme must be used within a ThemeProvider');
+  }
+  return context;
+};
+
+const ThemeProvider: React.FC<{ children: ReactNode; theme: Theme }> = ({ children, theme }) => (
+  <ThemeContext.Provider value={{ theme }}>
+    {children}
+  </ThemeContext.Provider>
+);
+
+const START_TIME = new Date('2025-12-22T00:00:00Z').getTime();
+const END_TIME = new Date().getTime(); // Now
+
+type FileStatus = 'loading' | 'found' | 'missing';
+
+export default function App() {
+  const [currentTime, setCurrentTime] = useState(START_TIME);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [speed, setSpeed] = useState(86400); // 1 day per real second
+
+  // Theme State
+  const [theme, setTheme] = useState<Theme>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('theme');
+      return (saved as Theme) || 'dark';
+    }
+    return 'dark';
+  });
+
+  // Apply theme to document
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'light') {
+      root.classList.add('light');
+      root.style.backgroundColor = '#f8fafc';
+    } else {
+      root.classList.remove('light');
+      root.style.backgroundColor = '#0f172a';
+    }
+  }, [theme]);
+
+  const toggleTheme = () => {
+    setTheme(prev => {
+      const newTheme = prev === 'dark' ? 'light' : 'dark';
+      localStorage.setItem('theme', newTheme);
+      return newTheme;
+    });
+  };
+
+  const [sentimentData, setSentimentData] = useState<SentimentItem[]>([]);
+  const [lensHistory, setLensHistory] = useState<LensHistoryItem[]>([]);
+  const [scenarios, setScenarios] = useState<Scenario[]>([]);
+  const [isGenerating, setIsGenerating] = useState(false);
+
+  const [fileStatus, setFileStatus] = useState<{ sentiment: FileStatus, lens: FileStatus }>({
+    sentiment: 'loading',
+    lens: 'loading'
+  });
+
+  // Asset Heatmap State
+  const [filterLowConfidence, setFilterLowConfidence] = useState(false);
+  const [sortBy, setSortBy] = useState<'score' | 'confidence' | 'asset'>('confidence');
+
+  // Analytics State
+  const [activeTab, setActiveTab] = useState<'performance' | 'news' | 'distribution'>('performance');
+
+  // Bottom-right panel tabs
+  const [bottomRightTab, setBottomRightTab] = useState<'timeline' | 'watchlist' | 'graph'>('timeline');
+
+  // Graph State
+  const [graphData, setGraphData] = useState<GraphData>({ nodes: [], edges: [] });
+  const [selectedNode, setSelectedNode] = useState<string | null>(null);
+  const [graphSearch, setGraphSearch] = useState('');
+  const [graphZoom, setGraphZoom] = useState(1);
+  const [graphPan, setGraphPan] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+
+  // LLM Settings State
+  const [llmProvider, setLlmProvider] = useState<'gemini' | 'ollama'>('gemini');
+  // @ts-ignore
+  const [geminiKey, setGeminiKey] = useState(import.meta.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || '');
+  const [ollamaUrl, setOllamaUrl] = useState('http://localhost:11434');
+  const [ollamaModel, setOllamaModel] = useState('qwen3.5:35b');
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
+  const [loadingModels, setLoadingModels] = useState(false);
+
+  // Load available Ollama models
+  useEffect(() => {
+    const loadModels = async () => {
+      try {
+        const res = await fetch(`${ollamaUrl}/api/tags`);
+        if (res.ok) {
+          const data = await res.json();
+          const modelNames = data.models?.map((m: any) => m.name) || [];
+          setAvailableModels(modelNames);
+          // Set default to qwen3.5:35b if available, otherwise first model
+          if (modelNames.includes('qwen3.5:35b')) {
+            setOllamaModel('qwen3.5:35b');
+          } else if (modelNames.length > 0) {
+            setOllamaModel(modelNames[0]);
+          }
+        }
+      } catch (e) {
+        console.error('Failed to load Ollama models:', e);
+      } finally {
+        setLoadingModels(false);
+      }
+    };
+
+    if (llmProvider === 'ollama') {
+      setLoadingModels(true);
+      loadModels();
+    }
+  }, [llmProvider, ollamaUrl]);
+
+  // Auto-load files on startup
+  useEffect(() => {
+    const loadFiles = async () => {
+      try {
+        const res = await fetch('/sentiment_cache_v2.json');
+        if (res.ok) {
+          const data = await res.json();
+          setSentimentData(parseSentimentCache(data, START_TIME, END_TIME));
+          setFileStatus(prev => ({ ...prev, sentiment: 'found' }));
+        } else {
+          setFileStatus(prev => ({ ...prev, sentiment: 'missing' }));
+        }
+      } catch (e) {
+        setFileStatus(prev => ({ ...prev, sentiment: 'missing' }));
+      }
+
+      try {
+        const res = await fetch('/lens_history.jsonl');
+        if (res.ok) {
+          const text = await res.text();
+          setLensHistory(parseLensHistory(text));
+          setFileStatus(prev => ({ ...prev, lens: 'found' }));
+        } else {
+          setFileStatus(prev => ({ ...prev, lens: 'missing' }));
+        }
+      } catch (e) {
+        setFileStatus(prev => ({ ...prev, lens: 'missing' }));
+      }
+    };
+    loadFiles();
+  }, []);
+
+  // Time Emulator Loop
+  useEffect(() => {
+    let lastTick = performance.now();
+    let animationFrameId: number;
+
+    const tick = (now: number) => {
+      if (isPlaying) {
+        const deltaMs = now - lastTick;
+        const simulatedDeltaMs = deltaMs * speed;
+        setCurrentTime((prev) => {
+          const nextTime = prev + simulatedDeltaMs;
+          if (nextTime >= END_TIME) {
+            setIsPlaying(false);
+            return END_TIME;
+          }
+          return nextTime;
+        });
+      }
+      lastTick = now;
+      animationFrameId = requestAnimationFrame(tick);
+    };
+
+    if (isPlaying) {
+      animationFrameId = requestAnimationFrame(tick);
+    }
+
+    return () => cancelAnimationFrame(animationFrameId);
+  }, [isPlaying, speed]);
+
+  const handleFileUpload = (event: React.ChangeEvent<HTMLInputElement>, type: 'sentiment' | 'lens') => {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const content = e.target?.result as string;
+      try {
+        if (type === 'sentiment') {
+          const json = JSON.parse(content);
+          setSentimentData(parseSentimentCache(json, START_TIME, END_TIME));
+        } else {
+          setLensHistory(parseLensHistory(content));
+        }
+      } catch (error) {
+        console.error(`Error parsing ${type} file:`, error);
+        alert(`Failed to parse ${type} file. Please ensure it's valid JSON/JSONL.`);
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  // Filter data based on current simulated time
+  const activeNews = useMemo(() => {
+    return sentimentData.filter((item) => item.timestamp <= currentTime).reverse();
+  }, [sentimentData, currentTime]);
+
+  const activeLenses = useMemo(() => {
+    return lensHistory.filter((item) => item.timestamp <= currentTime).reverse();
+  }, [lensHistory, currentTime]);
+
+  // Aggregate assets from all scenarios for heatmap
+  const heatmapAssets = useMemo((): AssetHeatmapItem[] => {
+    let assets: AssetHeatmapItem[] = [];
+    scenarios.forEach(scenario => {
+      scenario.affected_assets.forEach(asset => {
+        assets.push({
+          ...asset,
+          scenario_id: scenario.scenario_id,
+          scenario_title: scenario.title
+        });
+      });
+    });
+
+    if (filterLowConfidence) {
+      assets = assets.filter(a => a.confidence >= 0.5);
+    }
+
+    switch (sortBy) {
+      case 'score':
+        return assets.sort((a, b) => b.net_direction_score - a.net_direction_score);
+      case 'confidence':
+        return assets.sort((a, b) => b.confidence - a.confidence);
+      case 'asset':
+        return assets.sort((a, b) => a.asset.localeCompare(b.asset));
+    }
+  }, [scenarios, filterLowConfidence, sortBy]);
+
+  // === IMPACT AGGREGATOR: Net sentiment across all scenarios ===
+  const netSentiment = useMemo(() => {
+    const assetWeights: Record<string, {
+      totalWeightedScore: number;
+      totalConfidence: number;
+      bullishCount: number;
+      bearishCount: number;
+    }> = {};
+
+    scenarios.forEach(s => {
+      s.affected_assets.forEach(asset => {
+        const weight = s.confidence_score; // Higher confidence = more weight
+
+        if (!assetWeights[asset.asset]) {
+          assetWeights[asset.asset] = {
+            totalWeightedScore: 0,
+            totalConfidence: 0,
+            bullishCount: 0,
+            bearishCount: 0,
+          };
+        }
+
+        assetWeights[asset.asset].totalWeightedScore += asset.net_direction_score * weight;
+        assetWeights[asset.asset].totalConfidence += weight;
+
+        if (asset.direction === 'bullish') {
+          assetWeights[asset.asset].bullishCount++;
+        } else if (asset.direction === 'bearish') {
+          assetWeights[asset.asset].bearishCount++;
+        }
+      });
+    });
+
+    // Normalize and compute consensus
+    return Object.entries(assetWeights)
+      .map(([asset, data]) => ({
+        asset,
+        netScore: data.totalConfidence > 0 ? data.totalWeightedScore / data.totalConfidence : 0,
+        confidenceSum: data.totalConfidence,
+        bullishScenarios: data.bullishCount,
+        bearishScenarios: data.bearishCount,
+        consensus: data.bullishCount > data.bearishCount ? 'bullish' as const
+                  : data.bearishCount > data.bullishCount ? 'bearish' as const
+                  : 'mixed' as const
+      }))
+      .sort((a, b) => Math.abs(b.netScore) - Math.abs(a.netScore));
+  }, [scenarios]);
+
+  // === CONTRADICTION DETECTOR: Assets with conflicting signals ===
+  const contradictions = useMemo(() => {
+    const assetSignals: Record<string, {
+      bullishScenarios: string[];
+      bearishScenarios: string[];
+      avgConfidenceBullish: number;
+      avgConfidenceBearish: number;
+    }> = {};
+
+    scenarios.forEach(s => {
+      s.affected_assets.forEach(asset => {
+        if (!assetSignals[asset.asset]) {
+          assetSignals[asset.asset] = {
+            bullishScenarios: [],
+            bearishScenarios: [],
+            avgConfidenceBullish: 0,
+            avgConfidenceBearish: 0
+          };
+        }
+
+        if (asset.direction === 'bullish') {
+          assetSignals[asset.asset].bullishScenarios.push(s.scenario_id);
+          assetSignals[asset.asset].avgConfidenceBullish += s.confidence_score;
+        } else if (asset.direction === 'bearish') {
+          assetSignals[asset.asset].bearishScenarios.push(s.scenario_id);
+          assetSignals[asset.asset].avgConfidenceBearish += s.confidence_score;
+        }
+      });
+    });
+
+    // Filter to only assets with contradictory signals
+    const conflictingAssets = Object.entries(assetSignals)
+      .filter(([_, data]) => data.bullishScenarios.length > 0 && data.bearishScenarios.length > 0)
+      .map(([asset, data]) => {
+        const bullishAvg = data.bullishScenarios.length > 0
+          ? data.avgConfidenceBullish / data.bullishScenarios.length : 0;
+        const bearishAvg = data.bearishScenarios.length > 0
+          ? data.avgConfidenceBearish / data.bearishScenarios.length : 0;
+        return {
+          asset,
+          bullishScenarioIds: data.bullishScenarios,
+          bearishScenarioIds: data.bearishScenarios,
+          bullishAvg,
+          bearishAvg,
+          conflictSeverity: Math.abs(bullishAvg - bearishAvg)
+        };
+      })
+      .sort((a, b) => b.conflictSeverity - a.conflictSeverity);
+
+    return conflictingAssets;
+  }, [scenarios]);
+
+  // === SIGNAL WATCHLIST: Extract all confirmation/invalidation signals ===
+  const signalWatchlist = useMemo(() => {
+    const signals: Array<{
+      type: 'confirmation' | 'invalidation';
+      signal: string;
+      scenarioId: string;
+      scenarioTitle: string;
+      acknowledged: boolean;
+    }> = [];
+
+    scenarios.forEach(scenario => {
+      scenario.confirmation_signals.forEach(signal => {
+        signals.push({
+          type: 'confirmation',
+          signal,
+          scenarioId: scenario.scenario_id,
+          scenarioTitle: scenario.title,
+          acknowledged: false,
+        });
+      });
+      scenario.invalidation_signals.forEach(signal => {
+        signals.push({
+          type: 'invalidation',
+          signal,
+          scenarioId: scenario.scenario_id,
+          scenarioTitle: scenario.title,
+          acknowledged: false,
+        });
+      });
+    });
+
+    return signals;
+  }, [scenarios]);
+
+  // === SCENARIO TIMELINE: Track scenario lifecycle progression ===
+  const scenarioTimeline = useMemo(() => {
+    const lifecycleOrder = ['initializing', 'growing', 'mature', 'weakening', 'contradictory', 'archived'];
+
+    // Sort scenarios by generation time
+    const sortedScenarios = [...scenarios].sort((a, b) => a.generation_time - b.generation_time);
+
+    // Create timeline data points
+    const timeline: Array<{
+      generationTime: number;
+      scenarioId: string;
+      title: string;
+      lifecycleState: Scenario['lifecycle_state'];
+      confidenceScore: number;
+      dominantLens: string;
+      affectedAssets: number;
+      isLatest: boolean;
+    }> = sortedScenarios.map((s, idx) => ({
+      generationTime: s.generation_time,
+      scenarioId: s.scenario_id,
+      title: s.title,
+      lifecycleState: s.lifecycle_state,
+      confidenceScore: s.confidence_score,
+      dominantLens: s.dominant_lens,
+      affectedAssets: s.affected_assets.length,
+      isLatest: idx === sortedScenarios.length - 1
+    }));
+
+    // Calculate summary stats
+    const firstScenario = sortedScenarios[0];
+    const latestScenario = sortedScenarios[sortedScenarios.length - 1];
+
+    return {
+      timeline,
+      summary: {
+        totalScenarios: scenarios.length,
+        oldestGeneration: firstScenario?.generation_time || 0,
+        latestGeneration: latestScenario?.generation_time || 0,
+        dominantLens: latestScenario?.dominant_lens || 'N/A',
+        avgConfidence: scenarios.length > 0
+          ? scenarios.reduce((sum, s) => sum + s.confidence_score, 0) / scenarios.length
+          : 0
+      }
+    };
+  }, [scenarios]);
+
+  // === RELATIONSHIP GRAPH: Build graph data from scenarios ===
+  const graphDataComputed = useMemo(() => {
+    const nodes: Array<{ id: string; type: any; label: string; description?: string; data?: any }> = [];
+    const edges: Array<{ id: string; source: string; target: string; type: any; description?: string }> = [];
+
+    // Add assets as nodes
+    scenarios.forEach(scenario => {
+      scenario.affected_assets.forEach(asset => {
+        const assetId = `asset-${asset.asset}`;
+        nodes.push({
+          id: assetId,
+          type: 'asset',
+          label: asset.asset,
+          description: `${asset.direction}: ${asset.net_direction_score}`,
+          data: { confidence: asset.confidence, direction: asset.direction }
+        });
+
+        // Connect scenario to asset
+        edges.push({
+          id: `edge-${scenario.scenario_id}-${assetId}`,
+          source: scenario.scenario_id,
+          target: assetId,
+          type: 'affects',
+          description: `Affects ${asset.asset} (${asset.direction})`
+        });
+      });
+    });
+
+    // Add headline nodes from news
+    activeNews.slice(0, 10).forEach(news => {
+      const headlineId = `headline-${news.id}`;
+      nodes.push({
+        id: headlineId,
+        type: 'headline',
+        label: news.headline.length > 40 ? news.headline.substring(0, 40) + '...' : news.headline,
+        description: news.headline,
+        data: { timestamp: news.timestamp }
+      });
+
+      // Connect headline to scenarios via lens
+      scenarios.forEach(scenario => {
+        if (news.lens_used === scenario.dominant_lens) {
+          edges.push({
+            id: `edge-${headlineId}-${scenario.scenario_id}`,
+            source: headlineId,
+            target: scenario.scenario_id,
+            type: 'mentions',
+            description: `Supports ${scenario.title}`
+          });
+        }
+      });
+    });
+
+    // Add scenario nodes
+    scenarios.forEach(scenario => {
+      nodes.push({
+        id: scenario.scenario_id,
+        type: 'scenario',
+        label: scenario.title.length > 30 ? scenario.title.substring(0, 30) + '...' : scenario.title,
+        description: scenario.core_thesis,
+        data: {
+          lifecycle: scenario.lifecycle_state,
+          confidence: scenario.confidence_score,
+          timestamp: scenario.generation_time
+        }
+      });
+
+      // Confirmation signals
+      scenario.confirmation_signals.forEach((signal, idx) => {
+        const signalId = `confirm-${scenario.scenario_id}-${idx}`;
+        nodes.push({
+          id: signalId,
+          type: 'confirmation',
+          label: signal.length > 25 ? signal.substring(0, 25) + '...' : signal,
+          description: signal
+        });
+        edges.push({
+          id: `edge-confirm-${scenario.scenario_id}-${idx}`,
+          source: scenario.scenario_id,
+          target: signalId,
+          type: 'confirmed-by',
+          description: 'Confirmation signal'
+        });
+      });
+
+      // Invalidation signals
+      scenario.invalidation_signals.forEach((signal, idx) => {
+        const signalId = `invalid-${scenario.scenario_id}-${idx}`;
+        nodes.push({
+          id: signalId,
+          type: 'invalidation',
+          label: signal.length > 25 ? signal.substring(0, 25) + '...' : signal,
+          description: signal
+        });
+        edges.push({
+          id: `edge-invalid-${scenario.scenario_id}-${idx}`,
+          source: scenario.scenario_id,
+          target: signalId,
+          type: 'invalidated-by',
+          description: 'Invalidation signal'
+        });
+      });
+    });
+
+    return { nodes, edges };
+  }, [scenarios, activeNews]);
+
+  // Update graph data when scenarios change
+  useEffect(() => {
+    setGraphData(graphDataComputed);
+  }, [graphDataComputed]);
+
+  // Graph drag handlers
+  const handleGraphMouseDown = (e: React.MouseEvent) => {
+    if (e.target === e.currentTarget) {
+      setIsDragging(true);
+      setDragStart({ x: e.clientX - graphPan.x, y: e.clientY - graphPan.y });
+    }
+  };
+
+  const handleGraphMouseMove = (e: React.MouseEvent) => {
+    if (isDragging) {
+      setGraphPan({
+        x: e.clientX - dragStart.x,
+        y: e.clientY - dragStart.y
+      });
+    }
+  };
+
+  const handleGraphMouseUp = () => {
+    setIsDragging(false);
+  };
+
+  const handleGraphWheel = (e: React.WheelEvent) => {
+    e.preventDefault();
+    const newZoom = Math.min(Math.max(graphZoom - e.deltaY * 0.001, 0.25), 3);
+    setGraphZoom(newZoom);
+  };
+
+  // Helper to position nodes in a circular layout
+  const getNodePosition = (nodeId: string, nodeType: any, totalNodes: number) => {
+    const angle = ((parseInt(nodeId) % 360) / 360) * (Math.PI * 2);
+    const centerX = 0;
+    const centerY = 0;
+    const radius = 250;
+    return {
+      x: centerX + radius * Math.cos(angle),
+      y: centerY + radius * Math.sin(angle)
+    };
+  };
+
+  // Helper to get color intensity based on score
+  const getScoreColor = (score: number) => {
+    const intensity = Math.min(Math.abs(score) * 100, 100);
+    if (score > 0) {
+      return `rgb(16, 185, 129, ${intensity / 100})`; // emerald-500 with alpha
+    } else {
+      return `rgb(244, 63, 94, ${intensity / 100})`; // rose-500 with alpha
+    }
+  };
+
+  // Analytics Data - Asset performance over time
+  const assetHistory = useMemo((): Record<string, { time: number; score: number }[]> => {
+    const assetTimeline: Record<string, { time: number; score: number }[]> = {};
+    sentimentData.forEach(item => {
+      Object.entries(item.scores).forEach(([asset, score]: [string, number]) => {
+        if (!assetTimeline[asset]) assetTimeline[asset] = [];
+        assetTimeline[asset].push({ time: item.timestamp, score });
+      });
+    });
+
+    // Keep last 20 data points per asset for chart
+    Object.keys(assetTimeline).forEach(asset => {
+      assetTimeline[asset] = assetTimeline[asset].slice(-20);
+    });
+
+    return assetTimeline;
+  }, [sentimentData]);
+
+  // Analytics Data - News volume over time
+  const newsVolumeData = useMemo(() => {
+    const buckets: Record<string, number> = {};
+    const bucketSize = 2 * 60 * 60 * 1000; // 2 hour buckets
+
+    sentimentData.forEach(item => {
+      const bucketKey = Math.floor(item.timestamp / bucketSize) * bucketSize;
+      buckets[bucketKey] = (buckets[bucketKey] || 0) + 1;
+    });
+
+    return Object.entries(buckets)
+      .map(([time, count]) => ({ time: Number(time), count }))
+      .slice(-24); // Last 24 buckets
+  }, [sentimentData]);
+
+  // Analytics Data - Scenario distribution
+  const scenarioDistribution: Record<string, number> = useMemo(() => {
+    const counts: Record<string, number> = {};
+    scenarios.forEach(s => {
+      counts[s.lifecycle_state] = (counts[s.lifecycle_state] || 0) + 1;
+    });
+    return counts;
+  }, [scenarios]);
+
+  // Analytics Data - Most cited assets
+  const mostCitedAssets = useMemo(() => {
+    const counts: Record<string, number> = {};
+    sentimentData.forEach(item => {
+      Object.keys(item.scores).forEach(asset => {
+        counts[asset] = (counts[asset] || 0) + 1;
+      });
+    });
+
+    return Object.entries(counts)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([asset, count]) => ({ asset, count }));
+  }, [sentimentData]);
+
+  const triggerScenarioGeneration = async () => {
+    if (activeLenses.length === 0 || activeNews.length === 0) return;
+
+    setIsGenerating(true);
+    try {
+      const currentLens = activeLenses[0];
+      const config: LLMConfig = {
+        provider: llmProvider,
+        geminiKey,
+        ollamaUrl,
+        ollamaModel
+      };
+      const newScenarios = await generateScenarios(config, currentLens, activeNews);
+      setScenarios(newScenarios);
+    } catch (e) {
+      console.error("Failed to generate scenarios:", e);
+      alert("Failed to generate scenarios. Check console for details.");
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
+  const togglePlay = () => {
+    if (isPlaying) {
+      // Pausing -> trigger generation
+      setIsPlaying(false);
+      triggerScenarioGeneration();
+    } else {
+      // Playing
+      setIsPlaying(true);
+    }
+  };
+
+  return (
+    <ThemeProvider theme={theme}>
+      <div className={`flex h-screen font-sans overflow-hidden ${theme === 'light' ? 'bg-slate-50 text-slate-900' : 'bg-slate-950 text-slate-200'}`}>
+      {/* Sidebar / Controls */}
+      <div className={`w-80 flex flex-col border-r shadow-xl z-10 ${theme === 'light' ? 'bg-slate-50 border-slate-200' : 'bg-slate-900 border-slate-800'}`}>
+        <div className={`p-6 border-b ${theme === 'light' ? 'border-slate-200' : 'border-slate-800'}`}>
+          <div className="flex justify-between items-center mb-2">
+            <h1 className={`text-xl font-bold flex items-center gap-2 ${theme === 'light' ? 'text-slate-900' : 'text-white'}`}>
+              <Clock className={`w-5 h-5 ${theme === 'light' ? 'text-blue-600' : 'text-blue-400'}`} />
+              Time Emulator
+            </h1>
+            <button
+              onClick={toggleTheme}
+              className={`p-2 rounded-lg transition-colors ${theme === 'light' ? 'hover:bg-slate-200' : 'hover:bg-slate-800'}`}
+              title={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
+            >
+              {theme === 'dark' ? (
+                <Sun className="w-5 h-5 text-amber-400" />
+              ) : (
+                <Moon className="w-5 h-5 text-slate-600" />
+              )}
+            </button>
+          </div>
+          <p className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>Simulate market news and scenario chains over time.</p>
+        </div>
+
+        <div className={`p-6 flex-1 overflow-y-auto ${theme === 'light' ? 'bg-slate-50' : 'bg-slate-900'}`}>
+          {/* Time Controls */}
+          <div className="mb-8">
+            <h2 className={`text-sm font-semibold uppercase tracking-wider mb-4 ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>Playback Controls</h2>
+
+            <div className="text-center mb-4">
+              <div className={`text-2xl font-mono mb-1 ${theme === 'light' ? 'text-slate-900' : 'text-white'}`}>{formatTime(currentTime)}</div>
+              <div className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>Simulated Time</div>
+            </div>
+
+            <input
+              type="range"
+              min={START_TIME}
+              max={END_TIME}
+              value={currentTime}
+              onChange={(e) => setCurrentTime(Number(e.target.value))}
+              className={`w-full h-2 rounded-lg appearance-none cursor-pointer mb-4 accent-blue-500 ${theme === 'light' ? 'bg-slate-300' : 'bg-slate-700'}`}
+            />
+
+            <div className="flex items-center justify-center gap-4 mb-6">
+              <button
+                onClick={() => setCurrentTime(START_TIME)}
+                className={`p-2 rounded-full transition-colors ${theme === 'light' ? 'hover:bg-slate-200 text-slate-600' : 'hover:bg-slate-800 text-slate-400 hover:text-white'}`}
+                title="Reset to Start"
+              >
+                <Rewind className="w-5 h-5" />
+              </button>
+              <button
+                onClick={togglePlay}
+                className="p-4 rounded-full bg-blue-600 hover:bg-blue-500 text-white shadow-lg transition-all"
+              >
+                {isPlaying ? <Pause className="w-6 h-6" /> : <Play className="w-6 h-6 ml-1" />}
+              </button>
+              <button
+                onClick={() => setCurrentTime(END_TIME)}
+                className={`p-2 rounded-full transition-colors ${theme === 'light' ? 'hover:bg-slate-200 text-slate-600' : 'hover:bg-slate-800 text-slate-400 hover:text-white'}`}
+                title="Skip to End"
+              >
+                <FastForward className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-2">
+              <label className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>Playback Speed</label>
+              <select
+                value={speed}
+                onChange={(e) => setSpeed(Number(e.target.value))}
+                className={`w-full rounded-md py-2 px-3 text-sm focus:outline-none focus:border-blue-500 ${theme === 'light' ? 'bg-slate-100 border border-slate-300 text-slate-900' : 'bg-slate-800 border border-slate-700 text-slate-200'}`}
+              >
+                <option value={1}>1x (Realtime)</option>
+                <option value={3600}>1 Hour / sec</option>
+                <option value={86400}>1 Day / sec</option>
+                <option value={604800}>1 Week / sec</option>
+              </select>
+            </div>
+          </div>
+
+          {/* Data Upload */}
+          <div>
+            <h2 className={`text-sm font-semibold uppercase tracking-wider mb-4 ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>Data Sources</h2>
+            <div className="space-y-3">
+
+              {/* Sentiment Cache Status */}
+              <div className={`rounded-lg p-3 ${theme === 'light' ? 'bg-slate-100 border border-slate-300' : 'bg-slate-800 border border-slate-700'}`}>
+                <div className="flex justify-between items-center mb-2">
+                  <span className={`text-sm font-medium ${theme === 'light' ? 'text-slate-900' : 'text-slate-200'}`}>sentiment_cache_v2.json</span>
+                  {fileStatus.sentiment === 'loading' && <span className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>Scanning...</span>}
+                  {fileStatus.sentiment === 'found' && <span className={`text-xs ${theme === 'light' ? 'text-emerald-600' : 'text-emerald-400'} flex items-center gap-1`}><CheckCircle2 className="w-3 h-3" /> Found</span>}
+                  {fileStatus.sentiment === 'missing' && <span className={`text-xs ${theme === 'light' ? 'text-rose-600' : 'text-rose-400'} flex items-center gap-1`}><AlertCircle className="w-3 h-3" /> Missing</span>}
+                </div>
+                {fileStatus.sentiment === 'missing' && (
+                  <label className={`flex items-center justify-center gap-2 w-full border border-dashed rounded py-2 px-3 cursor-pointer transition-colors mt-2 ${theme === 'light' ? 'bg-slate-100 hover:bg-slate-200 border-slate-400' : 'bg-slate-900 hover:bg-slate-700 border-slate-600'}`}>
+                    <Upload className={`w-3.5 h-3.5 ${theme === 'light' ? 'text-slate-600' : 'text-slate-400'}`} />
+                    <span className={`text-xs ${theme === 'light' ? 'text-slate-700' : 'text-slate-300'}`}>Upload File</span>
+                    <input type="file" accept=".json" className="hidden" onChange={(e) => handleFileUpload(e, 'sentiment')} />
+                  </label>
+                )}
+                {fileStatus.sentiment === 'missing' && (
+                  <p className={`text-[10px] mt-2 leading-tight ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>News feed cannot replay until provided.</p>
+                )}
+              </div>
+
+              {/* Lens History Status */}
+              <div className={`rounded-lg p-3 ${theme === 'light' ? 'bg-slate-100 border border-slate-300' : 'bg-slate-800 border border-slate-700'}`}>
+                <div className="flex justify-between items-center mb-2">
+                  <span className={`text-sm font-medium ${theme === 'light' ? 'text-slate-900' : 'text-slate-200'}`}>lens_history.jsonl</span>
+                  {fileStatus.lens === 'loading' && <span className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>Scanning...</span>}
+                  {fileStatus.lens === 'found' && <span className={`text-xs ${theme === 'light' ? 'text-emerald-600' : 'text-emerald-400'} flex items-center gap-1`}><CheckCircle2 className="w-3 h-3" /> Found</span>}
+                  {fileStatus.lens === 'missing' && <span className={`text-xs ${theme === 'light' ? 'text-rose-600' : 'text-rose-400'} flex items-center gap-1`}><AlertCircle className="w-3 h-3" /> Missing</span>}
+                </div>
+                {fileStatus.lens === 'missing' && (
+                  <label className={`flex items-center justify-center gap-2 w-full border border-dashed rounded py-2 px-3 cursor-pointer transition-colors mt-2 ${theme === 'light' ? 'bg-slate-100 hover:bg-slate-200 border-slate-400' : 'bg-slate-900 hover:bg-slate-700 border-slate-600'}`}>
+                    <Upload className={`w-3.5 h-3.5 ${theme === 'light' ? 'text-slate-600' : 'text-slate-400'}`} />
+                    <span className={`text-xs ${theme === 'light' ? 'text-slate-700' : 'text-slate-300'}`}>Upload File</span>
+                    <input type="file" accept=".jsonl,.txt" className="hidden" onChange={(e) => handleFileUpload(e, 'lens')} />
+                  </label>
+                )}
+                {fileStatus.lens === 'missing' && (
+                  <p className={`text-[10px] mt-2 leading-tight ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>Lens regime context unavailable until provided.</p>
+                )}
+              </div>
+
+            </div>
+          </div>
+
+          {/* LLM Settings */}
+          <div className="mt-8">
+            <h2 className={`text-sm font-semibold uppercase tracking-wider mb-4 flex items-center gap-2 ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>
+              <Settings className="w-4 h-4" />
+              LLM Settings
+            </h2>
+            <div className="space-y-4">
+              <div className={`flex rounded-lg p-1 border ${theme === 'light' ? 'bg-slate-100 border-slate-300' : 'bg-slate-800 border-slate-700'}`}>
+                <button
+                  className={`flex-1 text-xs py-1.5 rounded-md transition-colors ${llmProvider === 'gemini' ? 'bg-blue-600 text-white' : ` ${theme === 'light' ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-slate-200'}`}`}
+                  onClick={() => setLlmProvider('gemini')}
+                >
+                  Gemini API
+                </button>
+                <button
+                  className={`flex-1 text-xs py-1.5 rounded-md transition-colors ${llmProvider === 'ollama' ? 'bg-blue-600 text-white' : ` ${theme === 'light' ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-slate-200'}`}`}
+                  onClick={() => setLlmProvider('ollama')}
+                >
+                  Ollama (Local)
+                </button>
+              </div>
+
+              {llmProvider === 'gemini' ? (
+                <div className="space-y-2">
+                  <label className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>Gemini API Key</label>
+                  <input
+                    type="password"
+                    value={geminiKey}
+                    onChange={(e) => setGeminiKey(e.target.value)}
+                    placeholder="AIzaSy..."
+                    className={`w-full rounded-md py-2 px-3 text-xs focus:outline-none focus:border-blue-500 ${theme === 'light' ? 'bg-slate-100 border border-slate-300 text-slate-900' : 'bg-slate-900 border border-slate-700 text-slate-200'}`}
+                  />
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <div className="space-y-1">
+                    <label className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>Available Models</label>
+                    {loadingModels ? (
+                      <div className={`w-full rounded-md py-2 px-3 text-xs flex items-center gap-2 ${theme === 'light' ? 'bg-slate-100 border border-slate-300 text-slate-600' : 'bg-slate-900 border border-slate-700 text-slate-500'}`}>
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        Loading models...
+                      </div>
+                    ) : availableModels.length > 0 ? (
+                      <select
+                        value={ollamaModel}
+                        onChange={(e) => setOllamaModel(e.target.value)}
+                        className={`w-full rounded-md py-2 px-3 text-xs focus:outline-none focus:border-blue-500 appearance-none ${theme === 'light' ? 'bg-slate-100 border border-slate-300 text-slate-900' : 'bg-slate-900 border border-slate-700 text-slate-200'}`}
+                      >
+                        {availableModels.map((model) => (
+                          <option key={model} value={model}>{model}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <div className={`w-full rounded-md py-2 px-3 text-xs ${theme === 'light' ? 'bg-slate-100 border border-slate-300 text-slate-600' : 'bg-slate-900 border border-slate-700 text-slate-500'}`}>
+                        No models found. Make sure Ollama is running.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <button
+                onClick={triggerScenarioGeneration}
+                disabled={isGenerating || activeNews.length === 0}
+                className={`w-full rounded-lg py-2 text-xs font-medium transition-colors flex items-center justify-center gap-2 ${theme === 'light' ? 'bg-slate-200 hover:bg-slate-300 text-slate-900 border border-slate-300' : 'bg-slate-800 hover:bg-slate-700 text-white border border-slate-700'}`}
+              >
+                {isGenerating ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Activity className={`w-3.5 h-3.5 ${theme === 'light' ? 'text-slate-600' : 'text-slate-300'}`} />}
+                Force Generate Now
+              </button>
+            </div>
+          </div>
+
+          {/* === SIGNAL WATCHLIST PANEL === */}
+          {contradictions.length > 0 && (
+            <div className="mb-6">
+              <div className="flex items-center gap-2 mb-3">
+                <AlertCircle className={`w-4 h-4 ${theme === 'light' ? 'text-amber-600' : 'text-amber-500'}`} />
+                <h2 className={`text-sm font-semibold uppercase tracking-wider ${theme === 'light' ? 'text-amber-700' : 'text-amber-400'}`}>Contradiction Alert</h2>
+              </div>
+              <div className={`rounded-lg p-3 space-y-2 ${theme === 'light' ? 'bg-amber-50 border border-amber-200' : 'bg-amber-500/10 border border-amber-500/30'}`}>
+                {contradictions.slice(0, 2).map(({ asset, bullishScenarioIds, bearishScenarioIds, bullishAvg, bearishAvg, conflictSeverity }) => (
+                  <div key={asset} className="space-y-1">
+                    <div className="flex justify-between items-center">
+                      <span className={`font-semibold text-sm ${theme === 'light' ? 'text-amber-900' : 'text-amber-200'}`}>{asset}</span>
+                      <span className={`text-xs ${theme === 'light' ? 'text-amber-700' : 'text-amber-400'}`}>{Math.round(conflictSeverity * 100)}% conflict</span>
+                    </div>
+                    <div className="flex items-center gap-2 text-xs">
+                      <span className={theme === 'light' ? 'text-emerald-600' : 'text-emerald-400'}>{(bullishAvg * 100).toFixed(0)}% conf from {bullishScenarioIds.length} scenarios</span>
+                      <span className={theme === 'light' ? 'text-slate-500' : 'text-slate-500'}>↔</span>
+                      <span className={theme === 'light' ? 'text-rose-600' : 'text-rose-400'}>{(bearishAvg * 100).toFixed(0)}% conf from {bearishScenarioIds.length} scenarios</span>
+                    </div>
+                  </div>
+                ))}
+                {contradictions.length > 2 && (
+                  <button className={`text-xs ${theme === 'light' ? 'text-amber-700 hover:text-amber-900' : 'text-amber-400 hover:text-amber-300'} mt-2`}>
+                    +{contradictions.length - 2} more conflicts
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ANALYTICS PANEL */}
+          <div className="mb-6">
+            <h2 className={`text-sm font-semibold uppercase tracking-wider mb-4 flex items-center gap-2 ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>
+              <Activity className={`w-4 h-4 ${theme === 'light' ? 'text-slate-600' : 'text-slate-300'}`} />
+              Analytics
+            </h2>
+            <div className="space-y-3">
+              {/* Tab buttons */}
+              <div className={`flex rounded-lg p-1 border ${theme === 'light' ? 'bg-slate-100 border-slate-300' : 'bg-slate-800 border-slate-700'}`}>
+                <button
+                  onClick={() => setActiveTab('performance')}
+                  className={`flex-1 text-xs py-1.5 rounded-md transition-colors ${
+                    activeTab === 'performance' ? 'bg-blue-600 text-white' : ` ${theme === 'light' ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-slate-200'}`
+                  }`}
+                >
+                  Performance
+                </button>
+                <button
+                  onClick={() => setActiveTab('netSentiment')}
+                  className={`flex-1 text-xs py-1.5 rounded-md transition-colors ${
+                    activeTab === 'netSentiment' ? 'bg-blue-600 text-white' : ` ${theme === 'light' ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-slate-200'}`
+                  }`}
+                >
+                  Net Sentiment
+                </button>
+                <button
+                  onClick={() => setActiveTab('news')}
+                  className={`flex-1 text-xs py-1.5 rounded-md transition-colors ${
+                    activeTab === 'news' ? 'bg-blue-600 text-white' : ` ${theme === 'light' ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-slate-200'}`
+                  }`}
+                >
+                  News Volume
+                </button>
+                <button
+                  onClick={() => setActiveTab('distribution')}
+                  className={`flex-1 text-xs py-1.5 rounded-md transition-colors ${
+                    activeTab === 'distribution' ? 'bg-blue-600 text-white' : ` ${theme === 'light' ? 'text-slate-600 hover:text-slate-900' : 'text-slate-400 hover:text-slate-200'}`
+                  }`}
+                >
+                  Distribution
+                </button>
+              </div>
+
+              {/* === NET SENTIMENT AGGREGATOR TAB === */}
+              {activeTab === 'netSentiment' && (
+                <div className="space-y-3">
+                  <div className={`text-xs mb-2 ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>
+                    Weighted average sentiment across all scenarios
+                  </div>
+                  <div className="space-y-2">
+                    {netSentiment.map(({ asset, netScore, bullishScenarios, bearishScenarios, consensus, confidenceSum }) => (
+                      <div key={asset} className={`rounded-lg p-3 border ${theme === 'light' ? 'bg-slate-100 border-slate-300' : 'bg-slate-800/50 border-slate-700'}`}>
+                        <div className="flex justify-between items-start mb-2">
+                          <div className="flex items-center gap-2">
+                            <span className={`font-semibold text-sm ${theme === 'light' ? 'text-slate-900' : 'text-slate-200'}`}>{asset}</span>
+                            <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                              consensus === 'bullish' ? (theme === 'light' ? 'bg-emerald-100 text-emerald-700 border-emerald-300' : 'bg-emerald-500/20 text-emerald-400 border-emerald-500/30') :
+                              consensus === 'bearish' ? (theme === 'light' ? 'bg-rose-100 text-rose-700 border-rose-300' : 'bg-rose-500/20 text-rose-400 border-rose-500/30') :
+                              (theme === 'light' ? 'bg-slate-200 text-slate-600 border-slate-400' : 'bg-slate-600/50 text-slate-400 border-slate-600')
+                            }`}>
+                              {consensus} consensus
+                            </span>
+                          </div>
+                          <span className={`text-sm font-mono font-semibold ${
+                            netScore > 0 ? 'text-emerald-500' : netScore < 0 ? 'text-rose-500' : ` ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`
+                          }`}>
+                            {netScore > 0 ? '+' : ''}{netScore.toFixed(3)}
+                          </span>
+                        </div>
+                        <div className={`h-1.5 rounded-full overflow-hidden mb-2 ${theme === 'light' ? 'bg-slate-200' : 'bg-slate-700'}`}>
+                          <div
+                            className={`h-full rounded-full transition-all ${
+                              netScore > 0 ? 'bg-emerald-500' : netScore < 0 ? 'bg-rose-500' : 'bg-slate-400'
+                            }`}
+                            style={{
+                              width: `${Math.abs(netScore) * 100}%`,
+                              marginLeft: netScore > 0 ? '50%' : netScore < 0 ? `${50 - Math.abs(netScore) * 100}%` : '0'
+                            }}
+                          />
+                        </div>
+                        <div className={`flex justify-between text-xs ${theme === 'light' ? 'text-slate-600' : 'text-slate-400'}`}>
+                          <span>{bullishScenarios} bullish scenario(s)</span>
+                          <span className={theme === 'light' ? 'text-slate-500' : 'text-slate-500'}>{confidenceSum.toFixed(1)} total conf. weight</span>
+                          <span>{bearishScenarios} bearish scenario(s)</span>
+                        </div>
+                      </div>
+                    ))}
+                    {netSentiment.length === 0 && (
+                      <div className="text-slate-500 text-xs py-8 text-center">No scenarios generated yet</div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Performance Chart */}
+              {activeTab === 'performance' && (
+                <div className="space-y-3">
+                  <div className={`text-xs mb-2 ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>
+                    {Object.keys(assetHistory).slice(0, 4).join(', ')}
+                  </div>
+                  <div className="space-y-2">
+                    {Object.entries(assetHistory).slice(0, 4).map(([asset, data]: [string, { time: number; score: number }[]]) => (
+                      <div key={asset} className="space-y-1">
+                        <div className="flex justify-between text-xs">
+                          <span className={`${theme === 'light' ? 'text-slate-900' : 'text-slate-300'}`}>{asset}</span>
+                          <span className={`font-mono ${
+                            data[data.length - 1]?.score > 0 ? 'text-emerald-500' :
+                            data[data.length - 1]?.score < 0 ? 'text-rose-500' : ` ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`
+                          }`}>
+                            {data[data.length - 1]?.score?.toFixed(2) || '0.00'}
+                          </span>
+                        </div>
+                        <div className="h-8 flex items-end gap-0.5">
+                          {data.map((point, i) => (
+                            <div
+                              key={i}
+                              className={`flex-1 rounded-sm ${
+                                point.score > 0 ? 'bg-emerald-500' :
+                                point.score < 0 ? 'bg-rose-500' : (theme === 'light' ? 'bg-slate-300' : 'bg-slate-600')
+                              }`}
+                              style={{
+                                height: `${Math.min(Math.abs(point.score) * 150, 32)}px`,
+                                opacity: 0.6 + (i / data.length) * 0.4
+                              }}
+                              title={`${point.score.toFixed(2)}`}
+                            />
+                          ))}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* News Volume Chart */}
+              {activeTab === 'news' && (
+                <div className="space-y-2">
+                  <div className="h-24 flex items-end gap-1">
+                    {newsVolumeData.map((point, i) => (
+                      <div
+                        key={i}
+                        className="flex-1 bg-blue-500 rounded-sm hover:bg-blue-400 transition-colors cursor-help relative group"
+                        style={{
+                          height: `${Math.min(point.count * 10, 64)}px`
+                        }}
+                        title={`Time: ${formatTime(point.time)}\nNews: ${point.count} items`}
+                      />
+                    ))}
+                    {newsVolumeData.length === 0 && (
+                      <div className={`text-xs py-8 ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>No news data</div>
+                    )}
+                  </div>
+                  <div className={`text-xs text-center ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>
+                    {newsVolumeData.length > 0 ? 'Items per 2-hour bucket' : 'Generate news data to see trends'}
+                  </div>
+                </div>
+              )}
+
+              {/* Scenario Distribution */}
+              {activeTab === 'distribution' && (
+                <div className="space-y-2">
+                  {Object.entries(scenarioDistribution).map(([state, count]: [string, number]) => {
+                    const maxCount = Math.max(...Object.values(scenarioDistribution));
+                    return (
+                    <div key={state} className="flex items-center gap-2">
+                      <span className={`text-xs capitalize w-24 ${theme === 'light' ? 'text-slate-900' : 'text-slate-300'}`}>{state}</span>
+                      <div className={`flex-1 h-2 rounded-full overflow-hidden ${theme === 'light' ? 'bg-slate-200' : 'bg-slate-800'}`}>
+                        <div
+                          className={`h-full rounded-full ${
+                            state === 'initializing' ? 'bg-blue-500' :
+                            state === 'growing' ? 'bg-emerald-500' :
+                            state === 'mature' ? 'bg-purple-500' :
+                            state === 'weakening' ? 'bg-amber-500' :
+                            state === 'contradictory' ? 'bg-rose-500' : (theme === 'light' ? 'bg-slate-300' : 'bg-slate-600')
+                          }`}
+                          style={{ width: `${(count / maxCount) * 100}%` }}
+                        />
+                      </div>
+                      <span className={`text-xs w-6 text-right ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>{count}</span>
+                    </div>
+                    );
+                  })}
+                  {Object.keys(scenarioDistribution).length === 0 && (
+                    <div className={`text-xs py-2 ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>No scenarios generated</div>
+                  )}
+                </div>
+              )}
+
+              {/* Most Cited Assets */}
+              <div className={`border-t pt-3 mt-3 ${theme === 'light' ? 'border-slate-200' : 'border-slate-800'}`}>
+                <h3 className={`text-xs font-semibold mb-2 ${theme === 'light' ? 'text-slate-500' : 'text-slate-400'}`}>Most Cited Assets</h3>
+                <div className="space-y-1">
+                  {mostCitedAssets.map(({ asset, count }) => (
+                    <div key={asset} className="flex justify-between text-xs">
+                      <span className={`${theme === 'light' ? 'text-slate-900' : 'text-slate-300'}`}>{asset}</span>
+                      <span className={theme === 'light' ? 'text-slate-500' : 'text-slate-500'}>{count} mentions</span>
+                    </div>
+                  ))}
+                  {mostCitedAssets.length === 0 && (
+                    <div className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>No data available</div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Main Content */}
+      <div className={`flex-1 flex flex-col min-w-0 ${theme === 'light' ? 'bg-slate-100' : 'bg-slate-950'}`}>
+        <div className={`flex-1 grid grid-cols-3 gap-px overflow-hidden ${theme === 'light' ? 'bg-slate-200' : 'bg-slate-800'}`}>
+
+          {/* Column 2: Live News Feed (top half of column) */}
+          <div className="flex flex-col min-h-0">
+            {/* News Feed */}
+            <div className={`flex-1 border-b ${theme === 'light' ? 'border-slate-200 bg-slate-50' : 'border-slate-800 bg-slate-950'}`}>
+              <div className={`p-4 border-b sticky top-0 z-10 flex items-center gap-2 ${theme === 'light' ? 'border-slate-200 bg-slate-100/50 backdrop-blur-sm' : 'border-slate-800 bg-slate-900/50 backdrop-blur-sm'}`}>
+                <Activity className={`w-5 h-5 ${theme === 'light' ? 'text-emerald-600' : 'text-emerald-400'}`} />
+                <h2 className={`font-semibold ${theme === 'light' ? 'text-slate-900' : 'text-white'}`}>Live News Feed</h2>
+                <span className={`ml-auto text-xs px-2 py-1 rounded-full ${theme === 'light' ? 'bg-slate-200 text-slate-600' : 'bg-slate-800 text-slate-400'}`}>
+                  {activeNews.length} items
+                </span>
+              </div>
+              <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
+                {activeNews.length === 0 ? (
+                  <div className={`text-center ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'} mt-10`}>No news available for this time period.</div>
+                ) : (
+                  activeNews.map((news) => (
+                    <NewsCard key={news.id} news={news} theme={theme} />
+                  ))
+                )}
+              </div>
+            </div>
+            {/* Analysis Panel (bottom half of column) */}
+            <div className={`flex-1 ${theme === 'light' ? 'bg-slate-50' : 'bg-slate-950'}`}>
+              <div className={`p-4 border-b sticky top-0 z-10 flex items-center gap-2 ${theme === 'light' ? 'border-slate-200 bg-slate-100/50 backdrop-blur-sm' : 'border-slate-800 bg-slate-900/50 backdrop-blur-sm'}`}>
+                <LayoutGrid className={`w-5 h-5 ${theme === 'light' ? 'text-blue-600' : 'text-blue-400'}`} />
+                <h2 className={`font-semibold ${theme === 'light' ? 'text-slate-900' : 'text-white'}`}>Analysis Panel</h2>
+              </div>
+              <div className="flex-1 p-4">
+                {/* Graph visualization will go here */}
+                <div className={`w-full h-full rounded-lg flex items-center justify-center ${theme === 'light' ? 'bg-slate-100 border border-slate-200' : 'bg-slate-900 border border-slate-800'}`}>
+                  <span className={`text-sm ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>Analysis visualization area</span>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Column 3: Scenario Chains (top half of column) + Asset Heatmap (bottom half) */}
+          <div className="flex flex-col min-h-0">
+            {/* Scenario Chains (top half) */}
+            <div className={`flex-1 border-b ${theme === 'light' ? 'border-slate-200 bg-slate-50' : 'border-slate-800 bg-slate-950'}`}>
+              <div className={`p-4 border-b sticky top-0 z-10 flex items-center gap-2 ${theme === 'light' ? 'border-slate-200 bg-slate-100/50 backdrop-blur-sm' : 'border-slate-800 bg-slate-900/50 backdrop-blur-sm'}`}>
+                <LinkIcon className={`w-5 h-5 ${theme === 'light' ? 'text-purple-600' : 'text-purple-400'}`} />
+                <h2 className={`font-semibold ${theme === 'light' ? 'text-slate-900' : 'text-white'}`}>Scenario Chains</h2>
+                <span className={`ml-auto text-xs px-2 py-1 rounded-full ${theme === 'light' ? 'bg-slate-200 text-slate-600' : 'bg-slate-800 text-slate-400'}`}>
+                  {scenarios.length} active
+                </span>
+              </div>
+              <div className="flex-1 overflow-y-auto p-4 space-y-6 custom-scrollbar relative">
+                {isGenerating && (
+                  <div className={`absolute inset-0 z-20 flex flex-col items-center justify-center backdrop-blur-sm ${theme === 'light' ? 'bg-slate-50/80' : 'bg-slate-950/80 backdrop-blur-sm'}`}>
+                    <Loader2 className="w-8 h-8 text-blue-500 animate-spin mb-4" />
+                    <p className={`text-sm font-medium ${theme === 'light' ? 'text-slate-900' : 'text-slate-300'}`}>Generating Scenarios via LLM...</p>
+                    <p className={`text-xs ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'} mt-2`}>Analyzing {activeNews.length} recent headlines</p>
+                  </div>
+                )}
+
+                {scenarios.length === 0 && !isGenerating ? (
+                  <div className={`text-center ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'} mt-10`}>
+                    <p>No scenario chains active yet.</p>
+                    <p className={`text-xs mt-2 ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>Pause playback or click "Force Generate Now" to create scenarios.</p>
+                  </div>
+                ) : (
+                  scenarios.map((scenario) => (
+                    <ScenarioCard key={scenario.scenario_id} scenario={scenario} theme={theme} />
+                  ))
+                )}
+              </div>
+            </div>
+            {/* Asset Heatmap (bottom half) */}
+            <div className={`flex-1 ${theme === 'light' ? 'bg-slate-50' : 'bg-slate-950'}`}>
+              <div className={`p-4 border-b sticky top-0 z-10 flex items-center gap-2 ${theme === 'light' ? 'border-slate-200 bg-slate-100/50 backdrop-blur-sm' : 'border-slate-800 bg-slate-900/50 backdrop-blur-sm'}`}>
+                <LayoutGrid className={`w-5 h-5 ${theme === 'light' ? 'text-emerald-600' : 'text-emerald-400'}`} />
+                <h2 className={`font-semibold ${theme === 'light' ? 'text-slate-900' : 'text-white'}`}>Asset Impact Heatmap</h2>
+              </div>
+              <div className="flex-1 p-4">
+                {/* Heatmap visualization placeholder */}
+                <div className={`w-full h-full rounded-lg ${theme === 'light' ? 'bg-slate-100 border border-slate-200' : 'bg-slate-900 border border-slate-800'}`}>
+                  <div className="w-full h-full rounded-lg flex items-center justify-center">
+                    <span className={`text-sm ${theme === 'light' ? 'text-slate-500' : 'text-slate-500'}`}>Asset Heatmap visualization area</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Asset Heatmap */}
+          <div className="bg-slate-950 flex flex-col min-h-0">
+            <div className="p-4 border-b border-slate-800 bg-slate-900/50 backdrop-blur-sm sticky top-0 z-10">
+              <div className="flex items-center justify-between mb-2">
+                <div className="flex items-center gap-2">
+                  <Activity className="w-5 h-5 text-cyan-400" />
+                  <h2 className="font-semibold text-white">Asset Impact Heatmap</h2>
+                  <span className="text-xs bg-slate-800 px-2 py-1 rounded-full text-slate-400">
+                    {heatmapAssets.length} assets
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setFilterLowConfidence(!filterLowConfidence)}
+                    className={`text-xs px-2 py-1 rounded transition-colors ${
+                      filterLowConfidence
+                        ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    }`}
+                    title="Show only assets with confidence >= 50%"
+                  >
+                    Filter &lt;50% conf
+                  </button>
+                  <select
+                    value={sortBy}
+                    onChange={(e) => setSortBy(e.target.value as 'score' | 'confidence' | 'asset')}
+                    className="text-xs bg-slate-800 border border-slate-700 rounded py-1 px-2 focus:outline-none focus:border-cyan-500"
+                  >
+                    <option value="confidence">Sort: Confidence</option>
+                    <option value="score">Sort: Impact Score</option>
+                    <option value="asset">Sort: Asset Name</option>
+                  </select>
+                </div>
+              </div>
+              <div className="flex items-center gap-4 text-[10px] text-slate-500">
+                <div className="flex items-center gap-1">
+                  <div className="w-3 h-3 bg-emerald-500" />
+                  <span>Bullish</span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <div className="w-3 h-3 bg-slate-600" />
+                  <span>Neutral</span>
+                </div>
+                <div className="flex items-center gap-1">
+                  <div className="w-3 h-3 bg-rose-500" />
+                  <span>Bearish</span>
+                </div>
+              </div>
+            </div>
+            <div className="flex-1 overflow-y-auto p-4 custom-scrollbar">
+              <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-3">
+                {heatmapAssets.map((asset) => (
+                  <div
+                    key={`${asset.scenario_id}-${asset.asset}`}
+                    className="rounded-lg border border-slate-700 p-3 transition-all hover:ring-2 hover:ring-cyan-500/50 cursor-pointer relative"
+                    style={{
+                      background: `linear-gradient(to bottom, rgba(0,0,0,0.3), transparent), ${getScoreColor(asset.net_direction_score)}`
+                    }}
+                    title={`${asset.asset}: ${asset.reasoning}`}
+                  >
+                    <div className="flex justify-between items-start mb-1">
+                      <span className="font-semibold text-sm text-slate-100">{asset.asset}</span>
+                      {asset.direction === 'bullish' ? (
+                        <TrendingUp className="w-4 h-4 text-emerald-300" />
+                      ) : asset.direction === 'bearish' ? (
+                        <TrendingDown className="w-4 h-4 text-rose-300" />
+                      ) : (
+                        <Minus className="w-4 h-4 text-slate-300" />
+                      )}
+                    </div>
+                    <div className="flex justify-between items-end">
+                      <div>
+                        <div className="text-xs font-mono text-slate-100">
+const getSentimentIntensity = (score: number) => Math.min(Math.abs(score) * 100, 100);
+// Get top 3 assets by absolute sentiment score
+const getTopAssets = (scores: Record<string, number>) => {
+  return Object.entries(scores)
+    .map(([asset, score]) => ({ asset, score }))
+    .sort((a, b) => Math.abs(b.score) - Math.abs(a.score))
+    .slice(0, 3);
+};
+
+const NewsCard: React.FC<{ news: SentimentItem; theme: Theme }> = ({ news, theme }) => {
+  const [expanded, setExpanded] = useState(false);
+  const topAssets = getTopAssets(news.scores);
+  const isLight = theme === 'light';
+
+  return (
+    <div className={`rounded-xl overflow-hidden hover:border-slate-700 transition-colors ${
+      isLight ? 'bg-white border border-slate-200' : 'bg-slate-900 border border-slate-800'
+    }`}>
+      <div className="p-4 cursor-pointer" onClick={() => setExpanded(!expanded)}>
+        <div className="flex justify-between items-start gap-4 mb-2">
+          <h3 className="font-medium text-slate-100 leading-snug">{news.headline}</h3>
+          {expanded ? <ChevronUp className="w-4 h-4 text-slate-500 shrink-0" /> : <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />}
+        </div>
+        <div className="flex items-center gap-3 text-xs mb-3">
+          <span className="text-slate-500">{formatTime(news.timestamp)}</span>
+          {news.lens_used && (
+            <span className="bg-purple-500/10 text-purple-400 px-2 py-0.5 rounded-full border border-purple-500/20">
+              {news.lens_used}
+            </span>
+          )}
+        </div>
+
+        {/* Inline top 3 asset sentiment bars */}
+        <div className="space-y-2">
+          {topAssets.map(({ asset, score }) => (
+            <div key={asset} className="flex items-center gap-2">
+              <span className="text-[10px] font-semibold text-slate-400 w-20 shrink-0 truncate">{asset}</span>
+              <div className="flex-1 h-1.5 bg-slate-800 rounded-full overflow-hidden">
+                <div
+                  className={`h-full rounded-full ${
+                    score > 0 ? 'bg-emerald-500' : score < 0 ? 'bg-rose-500' : 'bg-slate-600'
+                  }`}
+                  style={{ width: `${getSentimentIntensity(score)}%` }}
+                />
+              </div>
+              <span className={`text-[10px] font-mono w-10 text-right ${
+                score > 0 ? 'text-emerald-400' : score < 0 ? 'text-rose-400' : 'text-slate-500'
+              }`}>
+                {score > 0 ? '+' : ''}{score}
+              </span>
+            </div>
+          ))}
+        </div>
+
+        {/* Quick action button */}
+        <button
+          onClick={(e) => {
+            e.stopPropagation();
+            alert(`Added ${news.headline} to watchlist!`);
+          }}
+          className="mt-3 text-xs text-slate-400 hover:text-emerald-400 flex items-center gap-1 transition-colors"
+        >
+          <CheckCircle2 className="w-3.5 h-3.5" />
+          Track this headline
+        </button>
+      </div>
+
+      {expanded && (
+        <div className={`px-4 pb-4 border-t ${
+          isLight ? 'border-slate-200 pt-3 bg-slate-50/50' : 'border-slate-800/50 pt-3 bg-slate-900/50'
+        }`}>
+          <h4 className={`text-xs font-semibold uppercase tracking-wider mb-3 ${isLight ? 'text-slate-500' : 'text-slate-400'}`}>Full Asset Impact Analysis</h4>
+          <div className="space-y-3">
+            {Object.entries(news.scores).map(([asset, score]: [string, number]) => (
+              <div key={asset} className={`rounded-lg p-3 border ${
+                isLight ? 'bg-slate-50 border-slate-200' : 'bg-slate-800/50 border-slate-700/50'
+              }`}>
+                <div className="flex justify-between items-center mb-2">
+                  <span className={`font-medium text-sm ${isLight ? 'text-slate-900' : 'text-slate-200'}`}>{asset}</span>
+                  <span className={`text-xs font-mono px-2 py-0.5 rounded ${
+                    score > 0 ? (isLight ? 'bg-emerald-100 text-emerald-700' : 'bg-emerald-500/10 text-emerald-400') :
+                    score < 0 ? (isLight ? 'bg-rose-100 text-rose-700' : 'bg-rose-500/10 text-rose-400') :
+                    (isLight ? 'bg-slate-200 text-slate-600' : 'bg-slate-700 text-slate-400')
+                  }`}>
+                    {score > 0 ? '+' : ''}{score}
+                  </span>
+                </div>
+                <p className={`text-xs mb-2 leading-relaxed ${isLight ? 'text-slate-600' : 'text-slate-400'}`}>{news.reasoning[asset]}</p>
+                {news.lens_fit[asset] && news.lens_fit[asset] !== "No link." && (
+                  <div className={`flex items-start gap-1.5 text-xs p-2 rounded border ${
+                    isLight ? 'bg-purple-50 text-purple-800 border-purple-200' : 'bg-purple-500/5 text-purple-300/80 border-purple-500/10'
+                  }`}>
+                    <Info className={`w-3.5 h-3.5 mt-0.5 shrink-0 ${isLight ? 'text-purple-600' : 'text-purple-300'}`} />
+                    <span>{news.lens_fit[asset]}</span>
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const ScenarioCard: React.FC<{ scenario: Scenario; theme: Theme }> = ({ scenario, theme }) => {
+  // Calculate net directional bias
+  const bullishCount = scenario.affected_assets.filter(a => a.direction === 'bullish').length;
+  const bearishCount = scenario.affected_assets.filter(a => a.direction === 'bearish').length;
+  const netBias = bullishCount - bearishCount;
+
+  // Lifecycle dots positions
+  const lifecycleStates: Scenario['lifecycle_state'][] = ['initializing', 'growing', 'mature', 'weakening', 'contradictory', 'archived'];
+  const currentIndex = lifecycleStates.indexOf(scenario.lifecycle_state);
+  const isLight = theme === 'light';
+
+  return (
+    <div className={`rounded-xl overflow-hidden ${
+      isLight ? 'bg-white border border-slate-200' : 'bg-slate-900 border border-slate-700 shadow-lg shadow-black/20'
+    }`}>
+      {/* Header */}
+      <div className={`p-4 border-b ${
+        isLight ? 'border-slate-200 bg-slate-50/30' : 'border-slate-800 bg-slate-800/30'
+      }`}>
+        <div className="flex justify-between items-start gap-4 mb-2">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-3 mb-1">
+              <h3 className={`font-bold text-lg leading-snug truncate ${isLight ? 'text-slate-900' : 'text-slate-100'}`}>{scenario.title}</h3>
+              <span className={`text-[10px] uppercase tracking-wider px-2 py-1 rounded-full font-semibold shrink-0 ${
+                scenario.lifecycle_state === 'initializing' ? (isLight ? 'bg-blue-100 text-blue-700 border-blue-300' : 'bg-blue-500/20 text-blue-400 border border-blue-500/30') :
+                scenario.lifecycle_state === 'growing' ? (isLight ? 'bg-emerald-100 text-emerald-700 border-emerald-300' : 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30') :
+                scenario.lifecycle_state === 'mature' ? (isLight ? 'bg-purple-100 text-purple-700 border-purple-300' : 'bg-purple-500/20 text-purple-400 border border-purple-500/30') :
+                scenario.lifecycle_state === 'weakening' ? (isLight ? 'bg-amber-100 text-amber-700 border-amber-300' : 'bg-amber-500/20 text-amber-400 border border-amber-500/30') :
+                scenario.lifecycle_state === 'contradictory' ? (isLight ? 'bg-rose-100 text-rose-700 border-rose-300' : 'bg-rose-500/20 text-rose-400 border border-rose-500/30') :
+                (isLight ? 'bg-slate-200 text-slate-600 border-slate-400' : 'bg-slate-700 text-slate-300 border border-slate-600')
+              }`}>
+                {scenario.lifecycle_state}
+              </span>
+            </div>
+            <div className={`flex items-center gap-3 text-xs ${isLight ? 'text-slate-600' : 'text-slate-400'}`}>
+              <span className={`px-2 py-0.5 rounded border ${isLight ? 'bg-slate-100 border-slate-300 text-slate-800' : 'bg-slate-800 border-slate-700'}`}>Lens: {scenario.dominant_lens}</span>
+              <span className={`px-2 py-0.5 rounded border ${isLight ? 'bg-slate-100 border-slate-300 text-slate-800' : 'bg-slate-800 border-slate-700'}`}>Rank: {scenario.importance_rank}</span>
+              <span className={`text-xs font-semibold px-2 py-0.5 rounded border ${
+                scenario.confidence_score >= 0.7 ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' :
+                scenario.confidence_score >= 0.5 ? 'bg-amber-500/10 text-amber-400 border-amber-500/20' :
+                'bg-rose-500/10 text-rose-400 border-rose-500/20'
+              }`}>
+                Confidence: {Math.round(scenario.confidence_score * 100)}%
+              </span>
+            </div>
+          </div>
+        </div>
+        <p className={`text-sm leading-relaxed font-medium mb-2 ${isLight ? 'text-slate-900' : 'text-slate-300'}`}>{scenario.core_thesis}</p>
+        <div className={`text-xs italic ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>Trigger: {scenario.trigger_reason}</div>
+
+        {/* Lifecycle Progress Dots */}
+        <div className="flex items-center gap-1.5 mt-3">
+          <span className={`text-[10px] uppercase tracking-wider ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>Lifecycle:</span>
+          {lifecycleStates.map((state, idx) => (
+            <div key={state} className="flex items-center gap-1">
+              <div className={`w-2.5 h-2.5 rounded-full transition-colors ${
+                idx < currentIndex ? 'bg-emerald-500' :
+                idx === currentIndex ? (isLight ? 'bg-slate-400 ring-2 ring-emerald-500/50' : 'bg-slate-300 ring-2 ring-emerald-500/50') :
+                (isLight ? 'bg-slate-300' : 'bg-slate-700')
+              }`} title={state} />
+              {idx < lifecycleStates.length - 1 && <div className={`w-3 h-px ${isLight ? 'bg-slate-300' : 'bg-slate-700'}`} />}
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Asset Impact */}
+      <div className={`p-4 border-b ${isLight ? 'border-slate-200' : 'border-slate-800'}`}>
+        <div className="flex justify-between items-center mb-3">
+          <h4 className={`text-[10px] font-bold uppercase tracking-wider ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>Asset Impact</h4>
+          {netBias !== 0 && (
+            <span className={`text-xs font-semibold px-2 py-1 rounded flex items-center gap-1 ${
+              netBias > 0 ? 'bg-emerald-500/10 text-emerald-400' : 'bg-rose-500/10 text-rose-400'
+            }`}>
+              {netBias > 0 ? <TrendingUp className="w-3 h-3" /> : <TrendingDown className="w-3 h-3" />}
+              {netBias > 0 ? 'Bullish Bias' : 'Bearish Bias'}
+            </span>
+          )}
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          {scenario.affected_assets.map(asset => (
+            <div key={asset.asset} className={`rounded p-2 border flex flex-col gap-1 ${
+              isLight ? 'bg-slate-50 border-slate-200' : 'bg-slate-950 border-slate-800'
+            }`}>
+              <div className="flex justify-between items-center">
+                <span className={`font-semibold text-xs ${isLight ? 'text-slate-900' : 'text-slate-200'}`}>{asset.asset}</span>
+                {asset.direction === 'bullish' ? <TrendingUp className={`w-3.5 h-3.5 ${isLight ? 'text-emerald-600' : 'text-emerald-400'}`} /> :
+                 asset.direction === 'bearish' ? <TrendingDown className={`w-3.5 h-3.5 ${isLight ? 'text-rose-600' : 'text-rose-400'}`} /> :
+                 <Minus className={`w-3.5 h-3.5 ${isLight ? 'text-slate-500' : 'text-slate-400'}`} />}
+              </div>
+              <div className="flex justify-between items-center text-[10px]">
+                <span className={isLight ? 'text-slate-500' : 'text-slate-500'}>Score: {asset.net_direction_score > 0 ? '+' : ''}{asset.net_direction_score}</span>
+                <span className={isLight ? 'text-slate-500' : 'text-slate-500'}>Conf: {Math.round(asset.confidence * 100)}%</span>
+              </div>
+              <p className={`text-[10px] leading-tight ${isLight ? 'text-slate-600' : 'text-slate-400'}`}>{asset.reasoning}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Chains */}
+      <div className={`p-4 border-b ${isLight ? 'border-slate-200 bg-slate-50/50' : 'border-slate-800 bg-slate-900/50'}`}>
+        <div className="mb-4">
+          <h4 className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${isLight ? 'text-emerald-600' : 'text-emerald-500/80'}`}>Conventional Chain</h4>
+          <p className={`text-xs mb-2 ${isLight ? 'text-slate-800' : 'text-slate-300'}`}>{scenario.conventional.summary}</p>
+          <div className="space-y-1.5 pl-2 border-l-2 border-emerald-500/30">
+            {scenario.conventional.chain.map((step, i) => (
+              <div key={i} className={`text-xs flex gap-2 ${isLight ? 'text-slate-700' : 'text-slate-400'}`}>
+                <span className={`${isLight ? 'text-emerald-600' : 'text-emerald-500/50'} shrink-0`}>→</span>
+                <span>{step}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <h4 className={`text-[10px] font-bold uppercase tracking-wider mb-2 ${isLight ? 'text-amber-600' : 'text-amber-500/80'}`}>What If Else (Rebuttal)</h4>
+          <p className={`text-xs mb-1 ${isLight ? 'text-slate-800' : 'text-slate-300'}`}>{scenario.what_if_else.summary}</p>
+          <p className={`text-[10px] italic mb-2 ${isLight ? 'text-amber-700' : 'text-amber-400/80'}`}>Condition: {scenario.what_if_else.rebuttal_condition}</p>
+          <div className="space-y-1.5 pl-2 border-l-2 border-amber-500/30">
+            {scenario.what_if_else.alternate_chain.map((step, i) => (
+              <div key={i} className={`text-xs flex gap-2 ${isLight ? 'text-slate-700' : 'text-slate-400'}`}>
+                <span className={`${isLight ? 'text-amber-600' : 'text-amber-500/50'} shrink-0`}>→</span>
+                <span>{step}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      {/* Evidence & Signals */}
+      <div className={`p-4 text-[10px] ${isLight ? 'bg-slate-50' : 'bg-slate-950'}`}>
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <span className={`font-bold uppercase tracking-wider block mb-1 ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>Supporting Evidence</span>
+            <ul className="list-disc pl-3 space-y-1">
+              {scenario.supporting_headlines.map((h, i) => <li key={i} className={`truncate ${isLight ? 'text-slate-600' : 'text-slate-400'}`} title={h}>{h}</li>)}
+            </ul>
+          </div>
+          <div>
+            <span className={`font-bold uppercase tracking-wider block mb-1 ${isLight ? 'text-slate-500' : 'text-slate-500'}`}>Confirmation Signals</span>
+            <ul className="list-disc pl-3 space-y-1">
+              {scenario.confirmation_signals.map((h, i) => <li key={i} className={isLight ? 'text-slate-600' : 'text-slate-400'}>{h}</li>)}
+            </ul>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// Helper function to position nodes in a circular layout
+const getNodePosition = (nodeId: string, nodeType: any, totalNodes: number) => {
+  const angle = ((parseInt(nodeId) % 360) / 360) * (Math.PI * 2);
+  const centerX = 0;
+  const centerY = 0;
+  const radius = 150;
+  return {
+    x: centerX + radius * Math.cos(angle),
+    y: centerY + radius * Math.sin(angle)
+  };
+};
